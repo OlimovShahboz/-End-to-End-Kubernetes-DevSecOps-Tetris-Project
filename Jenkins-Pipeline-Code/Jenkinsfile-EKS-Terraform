@@ -1,72 +1,132 @@
-properties([
-    parameters([
-        string(defaultValue: 'variables.tfvars', description: 'Specify the file name', name: 'File-Name'),
-        choice(choices: ['plan', 'apply', 'destroy'], description: 'Select Terraform action', name: 'Terraform-Action')
-    ])
-])
+// Runs a terraform command inside EKS-TF with AWS credentials pulled from Vault.
+// The secrets exist only inside this block and are masked in the console log.
+def runTerraform(String args) {
+    withVault(
+        configuration: [
+            vaultUrl: 'http://127.0.0.1:8200',
+            vaultCredentialId: 'vault-approle',
+            engineVersion: 2
+        ],
+        vaultSecrets: [[
+            path: 'secret/tetris/aws',
+            secretValues: [
+                [envVar: 'AWS_ACCESS_KEY_ID',     vaultKey: 'access_key_id'],
+                [envVar: 'AWS_SECRET_ACCESS_KEY', vaultKey: 'secret_access_key'],
+                [envVar: 'AWS_DEFAULT_REGION',    vaultKey: 'region']
+            ]
+        ]]
+    ) {
+        dir(env.TF_DIR) {
+            sh "terraform ${args}"
+        }
+    }
+}
 
 pipeline {
     agent any
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+        timeout(time: 90, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+    }
+
+    parameters {
+        choice(name: 'TERRAFORM_ACTION', choices: ['plan', 'apply', 'destroy'],
+               description: 'plan = preview only, apply = build, destroy = tear down')
+        string(name: 'TFVARS_FILE', defaultValue: 'variables.tfvars',
+               description: 'Variables file inside EKS-TF')
+        string(name: 'GIT_BRANCH', defaultValue: 'main',
+               description: 'Branch to build')
+    }
+
+    environment {
+        TF_DIR           = 'EKS-TF'
+        TF_IN_AUTOMATION = 'true'
+        TF_INPUT         = '0'
+        REPO_URL         = 'https://github.com/OlimovShahboz/-End-to-End-Kubernetes-DevSecOps-Tetris-Project.git'
+    }
+
     stages {
         stage('Checkout from Git') {
             steps {
-                git branch: 'master', url: 'https://github.com/AmanPathak-DevOps/End-to-End-Kubernetes-DevSecOps-Tetris-Project.git'
+                cleanWs()
+                withCredentials([string(credentialsId: 'github-token', variable: 'GIT_TOKEN')]) {
+                    // Injects the token dynamically into the HTTPS URL securely
+                    git branch: params.GIT_BRANCH, url: "https://${env.GIT_TOKEN}@github.com/OlimovShahboz/-End-to-End-Kubernetes-DevSecOps-Tetris-Project.git"
+                }
             }
         }
-        stage('Initializing Terraform') {
+
+        stage('Check Tools') {
             steps {
-                withAWS(credentials: 'aws-key', region: 'us-east-1') {
-                dir('EKS-TF') {
-                    script {
-                        sh 'terraform init'
-                    }
-                }
-                }
+                sh 'terraform version && trivy --version'
             }
         }
-        stage('Validate Terraform Code') {
+
+        stage('Terraform Format Check') {
             steps {
-                withAWS(credentials: 'aws-key', region: 'us-east-1') {
-                dir('EKS-TF') {
-                    script {
-                        sh 'terraform validate'
-                    }
-                }
+                catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+                    script { runTerraform('fmt -check -recursive -no-color') }
                 }
             }
         }
+
+        stage('Terraform Init') {
+            steps {
+                script { runTerraform('init -input=false -no-color') }
+            }
+        }
+
+        stage('Terraform Validate') {
+            steps {
+                script { runTerraform('validate -no-color') }
+            }
+        }
+
+        stage('Security Scan (Trivy)') {
+            steps {
+                dir(env.TF_DIR) {
+                    sh 'trivy config --severity HIGH,CRITICAL --exit-code 0 .'
+                }
+            }
+        }
+
         stage('Terraform Plan') {
             steps {
-                withAWS(credentials: 'aws-key', region: 'us-east-1') {
-                dir('EKS-TF') {
-                    script {
-                        sh "terraform plan -var-file=${params.'File-Name'}"
-                    }
-                }
-                }
-            }
-        }
-        stage('Terraform Action') {
-            steps {
-                withAWS(credentials: 'aws-key', region: 'us-east-1') {
                 script {
-                    echo "${params.'Terraform-Action'}"
-                    dir('EKS-TF') {
-                        script {
-                            if (params.'Terraform-Action' == 'plan') {
-                                sh "terraform plan -var-file=${params.'File-Name'}"
-                            } else if (params.'Terraform-Action' == 'apply') {
-                                sh "terraform apply -auto-approve -var-file=${params.'File-Name'}"
-                            } else if (params.'Terraform-Action' == 'destroy') {
-                                sh "terraform destroy -auto-approve -var-file=${params.'File-Name'}"
-                            } else {
-                                error "Invalid value for Terraform-Action: ${params.'Terraform-Action'}"
-                            }
-                        }
-                    }
-                }
+                    def destroyFlag = (params.TERRAFORM_ACTION == 'destroy') ? '-destroy' : ''
+                    runTerraform("plan ${destroyFlag} -input=false -no-color -var-file=${params.TFVARS_FILE} -out=tfplan")
+                    runTerraform('show -no-color tfplan > tfplan.txt')
                 }
             }
         }
+
+        stage('Approval') {
+            when { expression { params.TERRAFORM_ACTION != 'plan' } }
+            steps {
+                timeout(time: 30, unit: 'MINUTES') {
+                    input message: "Review the plan above. Proceed with terraform ${params.TERRAFORM_ACTION}?",
+                          ok: 'Yes, proceed'
+                }
+            }
+        }
+
+        stage('Terraform Apply / Destroy') {
+            when { expression { params.TERRAFORM_ACTION != 'plan' } }
+            steps {
+                script { runTerraform('apply -input=false -no-color tfplan') }
+            }
+        }
+    }
+
+    post {
+        always {
+            archiveArtifacts artifacts: 'EKS-TF/tfplan.txt', allowEmptyArchive: true
+            cleanWs()
+        }
+        success { echo "Terraform ${params.TERRAFORM_ACTION} finished successfully." }
+        failure { echo 'Pipeline failed, check the stage that turned red.' }
     }
 }
