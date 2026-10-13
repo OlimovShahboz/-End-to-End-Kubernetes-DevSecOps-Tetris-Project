@@ -8,7 +8,7 @@ def runTerraform(String args) {
             engineVersion: 2
         ],
         vaultSecrets: [[
-            path: 'secret/tetris/aws',
+            path: 'secret/data/tetris/aws',
             secretValues: [
                 [envVar: 'AWS_ACCESS_KEY_ID',     vaultKey: 'access_key_id'],
                 [envVar: 'AWS_SECRET_ACCESS_KEY', vaultKey: 'secret_access_key'],
