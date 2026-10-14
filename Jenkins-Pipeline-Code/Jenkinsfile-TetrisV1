@@ -93,10 +93,15 @@ pipeline {
                 stage('OWASP Dependency-Check') {
                     steps {
                         dir(env.APP_DIR) {
-                            // Optional: add nvdCredentialsId: 'nvd-api-key' (Secret text) to avoid NVD rate limits
-                            dependencyCheck additionalArguments: '--scan ./ --disableYarnAudit --disableNodeAudit',
-                                            odcInstallation: 'DP-Check'
-                            dependencyCheckPublisher pattern: '**/dependency-check-report.xml'
+                            dependencyCheck(
+                                additionalArguments: '--scan ./ --disableYarnAudit --disableNodeAudit',
+                                odcInstallation: 'DP-Check',
+                                nvdCredentialsId: 'nvd-api-key'
+                            )
+
+                            dependencyCheckPublisher(
+                                pattern: '**/dependency-check-report.xml'
+                            )
                         }
                     }
                 }
@@ -127,17 +132,101 @@ pipeline {
         }
 
         // Scan BEFORE pushing so a vulnerable image never reaches the registry
-        stage('Trivy Image Scan') {
-            steps {
-                sh 'trivy image --format table -o trivyimage.txt "$IMAGE_REPO:$IMAGE_TAG"'
-                script {
-                    if (params.TRIVY_FAIL_ON != 'NONE') {
-                        def sev = (params.TRIVY_FAIL_ON == 'HIGH') ? 'HIGH,CRITICAL' : 'CRITICAL'
-                        sh "trivy image --exit-code 1 --severity ${sev} --ignore-unfixed --quiet \"\$IMAGE_REPO:\$IMAGE_TAG\""
+        
+            stage('Trivy Image Scan') {
+                steps {
+                    sh '''
+                        set -e
+                        trivy image \
+                        --ignore-unfixed \
+                        --format json \
+                        --output trivyimage.json \
+                        "$IMAGE_REPO:$IMAGE_TAG"
+                    '''
+
+                    script {
+                        // Print vulnerabilities that meet the selected threshold.
+                        def scanSummary = sh(
+                            returnStdout: true,
+                            script: '''
+                                python3 - <<'PY'
+            import json
+            import os
+
+            threshold = os.environ.get("TRIVY_FAIL_ON", "CRITICAL")
+            severity_order = {"LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
+            minimum = {"HIGH": 3, "CRITICAL": 4, "NONE": 99}.get(threshold, 4)
+
+            with open("trivyimage.json", encoding="utf-8") as f:
+                report = json.load(f)
+
+            findings = []
+            for result in report.get("Results") or []:
+                for vuln in result.get("Vulnerabilities") or []:
+                    severity = vuln.get("Severity", "").upper()
+                    if severity_order.get(severity, 0) >= minimum:
+                        findings.append((
+                            severity,
+                            result.get("Target", "unknown"),
+                            vuln.get("PkgName", "unknown"),
+                            vuln.get("VulnerabilityID", "unknown"),
+                            vuln.get("InstalledVersion", "unknown"),
+                            vuln.get("FixedVersion", "No fixed version listed"),
+                            vuln.get("Title", "No description provided")
+                        ))
+
+            findings.sort(key=lambda x: severity_order.get(x[0], 0), reverse=True)
+
+            print("Trivy threshold: " + threshold)
+            if findings:
+                print("Vulnerabilities requiring review:")
+                for severity, target, package, cve, installed, fixed, title in findings:
+                    print(f"[{severity}] {cve} | Package: {package}")
+                    print(f"  Target: {target}")
+                    print(f"  Installed: {installed} | Fixed: {fixed}")
+                    print(f"  Reason: {title}")
+            else:
+                print("No vulnerabilities matched the selected threshold.")
+
+            print(f"TRIVY_GATE_COUNT={len(findings)}")
+            PY
+                            '''
+                        ).trim()
+
+                        echo scanSummary
+
+                        def countMatcher = (scanSummary =~ /TRIVY_GATE_COUNT=(\d+)/)
+                        if (!countMatcher.find()) {
+                            error('Could not determine Trivy findings count.')
+                        }
+
+                        int findingCount = countMatcher.group(1).toInteger()
+
+                        if (findingCount > 0) {
+                            echo """
+                                SECURITY APPROVAL REQUIRED
+                                Trivy found ${findingCount} vulnerability finding(s)
+                                at the configured threshold: ${params.TRIVY_FAIL_ON}.
+                                Review the package, CVE, installed version, fixed version,
+                                and reason printed above before deciding.
+                                """
+
+                                 timeout(time: 15, unit: 'MINUTES') {
+                                input(
+                                    message: "Trivy found ${findingCount} qualifying vulnerability finding(s). Review the console output. Do you approve pushing and deploying this image?",
+                                    ok: 'Proceed anyway',
+                                    submitterParameter: 'TRIVY_APPROVED_BY'
+                                )
+                            }
+
+                            echo "Trivy risk accepted by: ${env.TRIVY_APPROVED_BY ?: 'authorized approver'}"
+                        } else {
+                            echo 'Trivy gate passed. No manual approval is required.'
+                        }
                     }
                 }
             }
-        }
+
 
         stage('Docker Push') {
             steps {
@@ -179,7 +268,8 @@ pipeline {
 
     post {
         always {
-            archiveArtifacts artifacts: '**/trivyfs.txt, trivyimage.txt, **/dependency-check-report.*', allowEmptyArchive: true
+            archiveArtifacts artifacts: '**/trivyfs.txt, trivyimage.txt, trivyimage.json, **/dependency-check-report.*',
+                 allowEmptyArchive: true
             sh '''
                 docker logout || true
                 docker rmi "$IMAGE_REPO:$IMAGE_TAG" || true
@@ -188,4 +278,5 @@ pipeline {
             cleanWs()
         }
     }
+    
 }
