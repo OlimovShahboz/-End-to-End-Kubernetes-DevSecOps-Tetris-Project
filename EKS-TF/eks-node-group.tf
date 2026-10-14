@@ -11,8 +11,8 @@ resource "aws_eks_node_group" "eks-node-group" {
     min_size     = 1
   }
 
-  instance_types = ["t3a.medium"]
-  disk_size      = 20
+  instance_types = ["c7i-flex.large"]
+  disk_size      = 12
 
   depends_on = [
     aws_iam_role_policy_attachment.AmazonEKSWorkerNodePolicy,
