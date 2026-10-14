@@ -1,116 +1,191 @@
+// Reads KV v2 secrets from Vault and exposes them as env vars inside the body.
+def withVaultKV(String path, Map keys, Closure body) {
+    def secretValues = []
+    for (e in keys) {
+        secretValues << [envVar: e.key, vaultKey: e.value]
+    }
+    withVault(
+        configuration: [
+            vaultUrl: 'http://127.0.0.1:8200',
+            vaultCredentialId: 'vault-approle',
+            engineVersion: 2
+        ],
+        vaultSecrets: [[path: path, secretValues: secretValues]]
+    ) {
+        body()
+    }
+}
+
 pipeline {
     agent any
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+        skipDefaultCheckout(true)
+        timeout(time: 60, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '15'))
+    }
+
+    parameters {
+        choice(name: 'TRIVY_FAIL_ON', choices: ['CRITICAL', 'HIGH', 'NONE'],
+               description: 'Fail the build before pushing if the image has vulnerabilities at this severity or above')
+    }
+
     tools {
         nodejs 'nodejs'
     }
-    environment  {
-        SCANNER_HOME=tool 'sonar-scanner'
+
+    environment {
+        SCANNER_HOME = tool 'sonar-scanner'
+
+        // CHANGE THESE
+        REPO_SLUG  = 'OlimovShahboz/-End-to-End-Kubernetes-DevSecOps-Tetris-Project'
+        IMAGE_REPO = 'shahboz01/tetris-v1'
+        BRANCH     = 'main'
+        APP_DIR      = 'Tetris-V1'
+        MANIFEST_DIR = 'Manifest-file'
     }
+
     stages {
-        stage('Cleaning Workspace') {
+
+        stage('Checkout') {
             steps {
                 cleanWs()
+                withCredentials([string(credentialsId: 'github-token', variable: 'GITHUB_TOKEN')]) {
+                    sh '''
+                        git clone --branch "$BRANCH" "https://x-access-token:${GITHUB_TOKEN}@github.com/${REPO_SLUG}.git" .
+                        git remote set-url origin "https://github.com/${REPO_SLUG}.git"
+                    '''
+                }
+                script {
+                    def sha = sh(returnStdout: true, script: 'git rev-parse --short HEAD').trim()
+                    env.IMAGE_TAG = "${env.BUILD_NUMBER}-${sha}"
+                }
             }
         }
-        stage('Checkout from Git') {
+
+        stage('Install Dependencies') {
             steps {
-                git branch: 'master', url: 'https://github.com/AmanPathak-DevOps/End-to-End-Kubernetes-DevSecOps-Tetris-Project.git'
+                dir(env.APP_DIR) {
+                    sh 'npm ci'
+                }
             }
         }
-        stage('Sonarqube Analysis') {
-            steps {
-                dir('Tetris-V1') {
-                    withSonarQubeEnv('sonar-scanner') {
-                        sh ''' $SCANNER_HOME/bin/sonar-scanner -Dsonar.projectName=Tetris \
-                        -Dsonar.projectKey=Tetris '''
+
+        stage('Code & Dependency Scans') {
+            parallel {
+                stage('SonarQube Analysis') {
+                    steps {
+                        dir(env.APP_DIR) {
+                            withSonarQubeEnv('sonar-scanner') {
+                                sh '''
+                                    $SCANNER_HOME/bin/sonar-scanner \
+                                      -Dsonar.projectName=Tetris \
+                                      -Dsonar.projectKey=Tetris \
+                                      -Dsonar.sources=src \
+                                      -Dsonar.exclusions=node_modules/**,build/**
+                                '''
+                            }
+                        }
                     }
                 }
-            }
-        }
-        stage('Quality Check') {
-            steps {
-                script {
-                    waitForQualityGate abortPipeline: false, credentialsId: 'sonar-token'
+                stage('OWASP Dependency-Check') {
+                    steps {
+                        dir(env.APP_DIR) {
+                            // Optional: add nvdCredentialsId: 'nvd-api-key' (Secret text) to avoid NVD rate limits
+                            dependencyCheck additionalArguments: '--scan ./ --disableYarnAudit --disableNodeAudit',
+                                            odcInstallation: 'DP-Check'
+                            dependencyCheckPublisher pattern: '**/dependency-check-report.xml'
+                        }
+                    }
                 }
-            }
-        }
-        stage('Installing Dependencies') {
-            steps {
-                dir('Tetris-V1') {
-                    sh 'npm install'
-                }
-            }
-        }
-        stage('OWASP Dependency-Check Scan') {
-            steps {
-                dir('Tetris-V1') {
-                    dependencyCheck additionalArguments: '--scan ./ --disableYarnAudit --disableNodeAudit', odcInstallation: 'DP-Check'
-                    dependencyCheckPublisher pattern: '**/dependency-check-report.xml'
-                }
-            }
-        }
-        stage('Trivy File Scan') {
-            steps {
-                dir('Tetris-V1') {
-                    sh 'trivy fs . > trivyfs.txt'
-                }
-            }
-        }
-        stage("Docker Image Build") {
-            steps {
-                script {
-                    dir('Tetris-V1') {
-                        withDockerRegistry(credentialsId: 'docker', toolName: 'docker') {
-                            sh 'docker system prune -f'
-                            sh 'docker build -t tetrisv1 .'
+                stage('Trivy FS Scan') {
+                    steps {
+                        dir(env.APP_DIR) {
+                            sh 'trivy fs --severity HIGH,CRITICAL --format table -o trivyfs.txt .'
                         }
                     }
                 }
             }
         }
-        stage("Docker Image Pushing") {
+
+        stage('Quality Gate') {
             steps {
+                timeout(time: 10, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: true
+                }
+            }
+        }
+
+        stage('Docker Build') {
+            steps {
+                dir(env.APP_DIR) {
+                    sh 'docker build --pull -t "$IMAGE_REPO:$IMAGE_TAG" .'
+                }
+            }
+        }
+
+        // Scan BEFORE pushing so a vulnerable image never reaches the registry
+        stage('Trivy Image Scan') {
+            steps {
+                sh 'trivy image --format table -o trivyimage.txt "$IMAGE_REPO:$IMAGE_TAG"'
                 script {
-                    withDockerRegistry(credentialsId: 'docker', toolName: 'docker') {
-                        sh 'docker tag tetrisv1 avian19/tetrisv1:${BUILD_NUMBER}'
-                        sh 'docker push avian19/tetrisv1:${BUILD_NUMBER}'
+                    if (params.TRIVY_FAIL_ON != 'NONE') {
+                        def sev = (params.TRIVY_FAIL_ON == 'HIGH') ? 'HIGH,CRITICAL' : 'CRITICAL'
+                        sh "trivy image --exit-code 1 --severity ${sev} --ignore-unfixed --quiet \"\$IMAGE_REPO:\$IMAGE_TAG\""
                     }
                 }
             }
         }
-        stage("TRIVY Image Scan") {
+
+        stage('Docker Push') {
             steps {
-                sh 'trivy image avian19/tetrisv1:${BUILD_NUMBER} > trivyimage.txt'
-            }
-        }
-        stage('Checkout Code') {
-            steps {
-                git branch: 'master', url: 'https://github.com/AmanPathak-DevOps/End-to-End-Kubernetes-DevSecOps-Tetris-Project.git'
-            }
-        }
-        stage('Update Deployment file') {
-            environment {
-                GIT_REPO_NAME = "End-to-End-Kubernetes-DevSecOps-Tetris-Project"
-                GIT_USER_NAME = "AmanPathak-DevOps"
-            }
-            steps {
-                dir('Manifest-file') {
-                    withCredentials([string(credentialsId: 'github', variable: 'GITHUB_TOKEN')]) {
+                script {
+                    withVaultKV('secret/tetris/dockerhub', [DOCKER_USER: 'username', DOCKER_TOKEN: 'token']) {
                         sh '''
-                            git config user.email "aman07pathak@gmail.com"
-                            git config user.name "AmanPathak-DevOps"
-                            BUILD_NUMBER=${BUILD_NUMBER}
-                            echo $BUILD_NUMBER
-                            imageTag=$(grep -oP '(?<=tetrisv1:)[^ ]+' deployment-service.yml)
-                            echo $imageTag
-                            sed -i "s/tetrisv1:${imageTag}/tetrisv1:${BUILD_NUMBER}/" deployment-service.yml
-                            git add deployment-service.yml
-                            git commit -m "Update deployment Image to version \${BUILD_NUMBER}"
-                            git push https://${GITHUB_TOKEN}@github.com/${GIT_USER_NAME}/${GIT_REPO_NAME} HEAD:master
+                            echo "$DOCKER_TOKEN" | docker login -u "$DOCKER_USER" --password-stdin
+                            docker push "$IMAGE_REPO:$IMAGE_TAG"
                         '''
                     }
                 }
             }
+        }
+
+        // GitOps: change the image tag in Git; ArgoCD syncs it to EKS
+        stage('Update Manifest (GitOps)') {
+            steps {
+                script {
+                    withCredentials([string(credentialsId: 'github-token', variable: 'GITHUB_TOKEN')]) {
+                        dir(env.MANIFEST_DIR) {
+                            sh '''
+                                set -e
+                                sed -i -E "s|image:[[:space:]]*${IMAGE_REPO}:.*|image: ${IMAGE_REPO}:${IMAGE_TAG}|" deployment-service.yml
+                                if git diff --quiet; then
+                                    echo "Manifest already up to date"; exit 0
+                                fi
+                                git config user.email "jenkins@tetris.local"
+                                git config user.name "jenkins-ci"
+                                git add deployment-service.yml
+                                git commit -m "ci: deploy ${IMAGE_REPO}:${IMAGE_TAG}"
+                                git push "https://x-access-token:${GITHUB_TOKEN}@github.com/${REPO_SLUG}.git" HEAD:${BRANCH}
+                            '''
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            archiveArtifacts artifacts: '**/trivyfs.txt, trivyimage.txt, **/dependency-check-report.*', allowEmptyArchive: true
+            sh '''
+                docker logout || true
+                docker rmi "$IMAGE_REPO:$IMAGE_TAG" || true
+                docker image prune -f || true
+            '''
+            cleanWs()
         }
     }
 }
