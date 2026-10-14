@@ -1,0 +1,14 @@
+
+node_modules
+build
+dist
+.git
+coverage
+.scannerwork
+trivyfs.txt
+trivyimage.txt
+trivyimage.json
+dependency-check-report.*
+.env
+.env.*
+!.env.example

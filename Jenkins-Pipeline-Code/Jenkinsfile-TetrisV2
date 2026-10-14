@@ -1,116 +1,327 @@
+
+def withVaultKV(String path, Map keys, Closure body) {
+    def secretValues = []
+    keys.each { key, vaultKey ->
+        secretValues << [envVar: key, vaultKey: vaultKey]
+    }
+
+    withVault(
+        configuration: [
+            vaultUrl: 'http://127.0.0.1:8200',
+            vaultCredentialId: 'vault-approle',
+            engineVersion: 2
+        ],
+        vaultSecrets: [[
+            path: path,
+            secretValues: secretValues
+        ]]
+    ) {
+        body()
+    }
+}
+
 pipeline {
     agent any
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+        skipDefaultCheckout(true)
+        timeout(time: 60, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '15'))
+    }
+
+    parameters {
+        choice(
+            name: 'TRIVY_FAIL_ON',
+            choices: ['CRITICAL', 'HIGH', 'NONE'],
+            description: 'Require approval if vulnerabilities meet this severity threshold'
+        )
+    }
+
     tools {
         nodejs 'nodejs'
     }
-    environment  {
-        SCANNER_HOME=tool 'sonar-scanner'
+
+    environment {
+        SCANNER_HOME = tool 'sonar-scanner'
+        REPO_SLUG    = 'OlimovShahboz/-End-to-End-Kubernetes-DevSecOps-Tetris-Project'
+        IMAGE_REPO   = 'shahboz01/tetris-v2'
+        BRANCH       = 'main'
+        APP_DIR      = 'Tetris-V2'
+        MANIFEST_DIR = 'Manifest-file'
+        TF_IN_AUTOMATION = 'true'
     }
+
     stages {
-        stage('Cleaning Workspace') {
+        stage('Checkout') {
             steps {
                 cleanWs()
+                withCredentials([
+                    string(credentialsId: 'github-token', variable: 'GITHUB_TOKEN')
+                ]) {
+                    sh '''
+                        set -eu
+                        git clone --branch "$BRANCH" \
+                          "https://x-access-token:${GITHUB_TOKEN}@github.com/${REPO_SLUG}.git" .
+                        git remote set-url origin \
+                          "https://github.com/${REPO_SLUG}.git"
+                    '''
+                }
+
+                script {
+                    def sha = sh(
+                        returnStdout: true,
+                        script: 'git rev-parse --short HEAD'
+                    ).trim()
+
+                    env.IMAGE_TAG = "${env.BUILD_NUMBER}-${sha}"
+                }
             }
         }
-        stage('Checkout from Git') {
+
+        stage('Check Tools') {
             steps {
-                git branch: 'master', url: 'https://github.com/AmanPathak-DevOps/End-to-End-Kubernetes-DevSecOps-Tetris-Project.git'
+                sh 'node --version && npm --version && docker --version && trivy --version'
             }
         }
-        stage('Sonarqube Analysis') {
+
+        stage('Install Dependencies') {
             steps {
-                dir('Tetris-V2') {
-                    withSonarQubeEnv('sonar-server') {
-                        sh ''' $SCANNER_HOME/bin/sonar-scanner -Dsonar.projectName=Tetris \
-                        -Dsonar.projectKey=Tetris '''
+                dir(env.APP_DIR) {
+                    sh 'npm ci'
+                }
+            }
+        }
+
+        stage('Code & Dependency Scans') {
+            parallel {
+                stage('SonarQube Analysis') {
+                    steps {
+                        dir(env.APP_DIR) {
+                            withSonarQubeEnv('sonar-scanner') {
+                                sh '''
+                                    "$SCANNER_HOME/bin/sonar-scanner" \
+                                      -Dsonar.projectName=Tetris-V2 \
+                                      -Dsonar.projectKey=Tetris-V2 \
+                                      -Dsonar.sources=src \
+                                      -Dsonar.exclusions=node_modules/**,build/**,dist/**
+                                '''
+                            }
+                        }
                     }
                 }
-            }
-        }
-        stage('Quality Check') {
-            steps {
-                script {
-                    waitForQualityGate abortPipeline: false, credentialsId: 'sonar-token'
+
+                stage('OWASP Dependency-Check') {
+                    steps {
+                        dir(env.APP_DIR) {
+                            dependencyCheck(
+                                additionalArguments: '--scan ./ --disableYarnAudit --disableNodeAudit',
+                                odcInstallation: 'DP-Check',
+                                nvdCredentialsId: 'nvd-api-key'
+                            )
+                            dependencyCheckPublisher(
+                                pattern: '**/dependency-check-report.xml'
+                            )
+                        }
+                    }
                 }
-            }
-        }
-        stage('Installing Dependencies') {
-            steps {
-                dir('Tetris-V2') {
-                    sh 'npm install'
-                }
-            }
-        }
-        stage('OWASP Dependency-Check Scan') {
-            steps {
-                dir('Tetris-V2') {
-                    dependencyCheck additionalArguments: '--scan ./ --disableYarnAudit --disableNodeAudit', odcInstallation: 'DP-Check'
-                    dependencyCheckPublisher pattern: '**/dependency-check-report.xml'
-                }
-            }
-        }
-        stage('Trivy File Scan') {
-            steps {
-                dir('Tetris-V2') {
-                    sh 'trivy fs . > trivyfs.txt'
-                }
-            }
-        }
-        stage("Docker Image Build") {
-            steps {
-                script {
-                    dir('Tetris-V2') {
-                        withDockerRegistry(credentialsId: 'docker', toolName: 'docker') {
-                            sh 'docker system prune -f'
-                            sh 'docker build -t tetrisv1 .'
+
+                stage('Trivy Filesystem Scan') {
+                    steps {
+                        dir(env.APP_DIR) {
+                            sh '''
+                                trivy fs \
+                                  --severity HIGH,CRITICAL \
+                                  --format table \
+                                  --output trivyfs.txt .
+                            '''
                         }
                     }
                 }
             }
         }
-        stage("Docker Image Pushing") {
+
+        stage('Quality Gate') {
             steps {
+                timeout(time: 10, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: true
+                }
+            }
+        }
+
+        stage('Docker Build') {
+            steps {
+                dir(env.APP_DIR) {
+                    sh 'docker build --pull -t "$IMAGE_REPO:$IMAGE_TAG" .'
+                }
+            }
+        }
+
+        stage('Trivy Image Scan & Approval') {
+            steps {
+                sh '''
+                    trivy image \
+                      --ignore-unfixed \
+                      --format json \
+                      --output trivyimage.json \
+                      "$IMAGE_REPO:$IMAGE_TAG"
+                '''
+
                 script {
-                    withDockerRegistry(credentialsId: 'docker', toolName: 'docker') {
-                        sh 'docker tag tetrisv1 avian19/tetrisv1:${BUILD_NUMBER}'
-                        sh 'docker push avian19/tetrisv1:${BUILD_NUMBER}'
+                    def summary = withEnv([
+                        "TRIVY_THRESHOLD=${params.TRIVY_FAIL_ON}"
+                    ]) {
+                        sh(
+                            returnStdout: true,
+                            script: '''
+                                python3 - <<'PY'
+import json
+import os
+
+threshold = os.environ["TRIVY_THRESHOLD"]
+rank = {"LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
+minimum = {"CRITICAL": 4, "HIGH": 3, "NONE": 99}[threshold]
+
+with open("trivyimage.json", encoding="utf-8") as f:
+    report = json.load(f)
+
+findings = []
+for result in report.get("Results") or []:
+    for vuln in result.get("Vulnerabilities") or []:
+        severity = (vuln.get("Severity") or "").upper()
+        if rank.get(severity, 0) >= minimum:
+            findings.append((
+                severity,
+                result.get("Target", "unknown"),
+                vuln.get("PkgName", "unknown"),
+                vuln.get("VulnerabilityID", "unknown"),
+                vuln.get("InstalledVersion", "unknown"),
+                vuln.get("FixedVersion") or "No fix listed",
+                vuln.get("Title") or "No description supplied"
+            ))
+
+findings.sort(key=lambda item: rank.get(item[0], 0), reverse=True)
+
+print(f"Configured Trivy threshold: {threshold}")
+for severity, target, package, cve, installed, fixed, reason in findings:
+    print(f"[{severity}] {cve} | Package: {package}")
+    print(f"  Target: {target}")
+    print(f"  Installed: {installed} | Fixed version: {fixed}")
+    print(f"  Reason: {reason}")
+
+print(f"TRIVY_GATE_COUNT={len(findings)}")
+PY
+                            '''
+                        ).trim()
+                    }
+
+                    echo summary
+
+                    def matcher = summary =~ /TRIVY_GATE_COUNT=(\\d+)/
+                    if (!matcher.find()) {
+                        error('Unable to parse Trivy findings; refusing to continue.')
+                    }
+
+                    int count = matcher.group(1).toInteger()
+
+                    if (count > 0) {
+                        echo "SECURITY APPROVAL REQUIRED: ${count} finding(s) meet the ${params.TRIVY_FAIL_ON} threshold. Review the vulnerability details above."
+
+                        timeout(time: 15, unit: 'MINUTES') {
+                            input(
+                                message: "Trivy found ${count} qualifying finding(s). Approve pushing this image and updating the manifest?",
+                                ok: 'Proceed anyway'
+                            )
+                        }
+
+                        echo 'Security findings manually accepted. Continuing pipeline.'
+                    } else {
+                        echo 'No findings matched the configured approval threshold.'
                     }
                 }
             }
         }
-        stage("TRIVY Image Scan") {
+
+        stage('Docker Push') {
             steps {
-                sh 'trivy image avian19/tetrisv1:${BUILD_NUMBER} > trivyimage.txt'
-            }
-        }
-        stage('Checkout Code') {
-            steps {
-                git branch: 'master', url: 'https://github.com/AmanPathak-DevOps/End-to-End-Kubernetes-DevSecOps-Tetris-Project.git'
-            }
-        }
-        stage('Update Deployment file') {
-            environment {
-                GIT_REPO_NAME = "End-to-End-Kubernetes-DevSecOps-Tetris-Project"
-                GIT_USER_NAME = "AmanPathak-DevOps"
-            }
-            steps {
-                dir('Manifest-file') {
-                    withCredentials([string(credentialsId: 'github', variable: 'GITHUB_TOKEN')]) {
+                script {
+                    withVaultKV(
+                        'secret/tetris/dockerhub',
+                        [DOCKER_USER: 'username', DOCKER_TOKEN: 'token']
+                    ) {
                         sh '''
-                            git config user.email "aman07pathak@gmail.com"
-                            git config user.name "AmanPathak-DevOps"
-                            BUILD_NUMBER=${BUILD_NUMBER}
-                            echo $BUILD_NUMBER
-                            imageTag=$(grep -oP '(?<=tetrisv1:)[^ ]+' deployment-service.yml)
-                            echo $imageTag
-                            sed -i "s/tetrisv1:${imageTag}/tetrisv1:${BUILD_NUMBER}/" deployment-service.yml
-                            git add deployment-service.yml
-                            git commit -m "Update deployment Image to version \${BUILD_NUMBER}"
-                            git push https://${GITHUB_TOKEN}@github.com/${GIT_USER_NAME}/${GIT_REPO_NAME} HEAD:master
+                            set +x
+                            echo "$DOCKER_TOKEN" |
+                              docker login -u "$DOCKER_USER" --password-stdin
+                            docker push "$IMAGE_REPO:$IMAGE_TAG"
                         '''
                     }
                 }
             }
+        }
+
+        stage('Update Manifest (GitOps)') {
+            steps {
+                withCredentials([
+                    string(credentialsId: 'github-token', variable: 'GITHUB_TOKEN')
+                ]) {
+                    dir(env.MANIFEST_DIR) {
+                        sh '''
+                            set -eu
+
+                            git config user.email "jenkins@tetris.local"
+                            git config user.name "jenkins-ci"
+
+                            sed -i -E \
+                              "s|image:[[:space:]]*${IMAGE_REPO}:[^[:space:]]+|image: ${IMAGE_REPO}:${IMAGE_TAG}|" \
+                              deployment-service.yml
+
+                            if git diff --quiet -- deployment-service.yml; then
+                                echo "Manifest image is already up to date."
+                                exit 0
+                            fi
+
+                            git add deployment-service.yml
+                            git commit -m "ci: deploy ${IMAGE_REPO}:${IMAGE_TAG}"
+
+                            git push \
+                              "https://x-access-token:${GITHUB_TOKEN}@github.com/${REPO_SLUG}.git" \
+                              HEAD:${BRANCH}
+                        '''
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            archiveArtifacts(
+                artifacts: '**/trivyfs.txt, trivyimage.json, **/dependency-check-report.*',
+                allowEmptyArchive: true
+            )
+
+            sh '''
+                docker logout || true
+                if [ -n "$IMAGE_TAG" ]; then
+                    docker image rm "$IMAGE_REPO:$IMAGE_TAG" || true
+                fi
+            '''
+
+            cleanWs()
+        }
+
+        success {
+            echo 'Tetris V2 pipeline completed successfully.'
+        }
+
+        failure {
+            echo 'Pipeline failed. Check the first failed stage in the console.'
+        }
+
+        aborted {
+            echo 'Pipeline was aborted. If the Trivy approval was pending, review the vulnerability details above.'
         }
     }
 }
